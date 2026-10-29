@@ -1,4 +1,4 @@
-# Handoff: engine port push (updated 2026-10-27)
+# Handoff: engine port push (updated 2026-10-29)
 
 For the next Claude session leading the nv-rs engine port. Read AGENTS.md,
 docs/MILESTONES.md, docs/ENGINE_PORT_PLAN.md, docs/FRAME_SKELETON.md and
@@ -7,7 +7,40 @@ machinery runs.
 
 ## Resume here
 
-### Claude lead, 2026-10-26/27 (current; read this first, then 2026-10-23/24 below)
+### Claude lead, 2026-10-28/29 (current; read this first, then 2026-10-26/27 below)
+
+**This PR brings the play branch's work since #251 to main** (play commits after 3d9900fd, replayed on main; the race-menu file was merged by hand onto #248's exe-shaped frames). The play builds up to p205 did **not** have #248's changes to the files it and the play branch both touched (they were merged only on main), nor `GetFullPathNameA` in the platform layer. The play worktree (private `wt-build43`) is now reset to this PR's head (the old play head is the local branch `play-before-1029-reset`): p206, built from it, reaches the race menu with the face drawn and lit. Its branch is still named `claude/build43-movement`; after the merge, reset it to main. Tests whose expected values were measured on the reference machine skip on other processors (`RSQRTSS`/`RCPSS` estimates differ by maker; `d3dx::single::reference_estimates`) and without its `RESAMPLEDMO.DLL` build.
+
+**What the play build does now (Windows, `NV_D3D9=real NV_SOUND=out`):** new game, Doc Mitchell's house, the opening speech, the name box, getting up from the bed, the race menu; the port's own saves load back (`NV_SAVE_OUT` copies them to a scratch folder). Sound matches the player's DirectSound bit for bit (both resamplers, the 3D stage, distortion; docs/SOUND.md); the maintainer wants sound exact, never approximate. Frame rate: 1:1 is the game's own limiter (about 133 fps here); `NV_UNCAP=1` (opt-in, not 1:1, `crates/host/src/uncap.rs`) removes it, and the maintainer's goal is 200+ fps in the same scenes. With `NV_D3D9=real` the viewer's own window is hidden and the game frame runs beside Bevy's (`NV_VIEWER_WINDOW=1`, `NV_GAME_FRAME_SYNC=1` give the old behaviour). `GetTickCount` moves in 15.625 ms steps, as measured here.
+
+**Fixes this round (each against the exe):** the lip-sync and render-pass freezes (00553bb0's 0x24 local, 00518f00's 0x18 DoorLock), the Havok GSK manifold (00dae3a0) and capsule-triangle agent frame, the bed freeze (006f9850 returns its EAX), the save load (004c77d3's slot word), stretched heads (hkaPose local-from-model), speech pacing (00935f00 callback), BSAudio message 56's vector address, process-list slots, GetLocalTime, the race-menu frustum near/far (007fd194, 007fdd9b: left at 0 the far plane culled every face light), and the device passed once as the COM `this` (00876924, 0086b3a6).
+
+**Diagnostics (all env-gated, not exe behaviour):** `NV_HKMEM_CHECK`, `NV_SPEECH_CHECK`, `NV_PASS_CHECK`, `NV_LIGHT_CHECK`, `NV_QUEUE_CHECK`, `NV_FACE_CHECK`, `NV_HEAD_CHECK`, `NV_BLOCK_CHECK` (guard bytes after heap blocks and `with_stack` locals: the fastest way to find an undersized local), `NV_AUDIO_CHECK`, `NV_PROFILE` (+`_THREADS`), `NV_SHOT=DIR[,ms]` (BMPs of the real back buffer: use these, not screen copies, for screenshots; a screen copy once caught the old viewer window), `NV_TRACE_OUT`/`NV_TRACE_LIST` (the port's call trace).
+
+**research/nv-trace (new):** records the real FalloutNV.exe (a recorder DLL, DirectInput key scripts, the folder guard, PrintWindow shots checked by PID) and the port, then diffs the calls (`nv-trace diff`) or the Direct3D 9 calls draw by draw (`nv-trace d3d REAL PORT`). Never write into the player's folders; the launcher uses scratch INI copies.
+
+**Next, in order:**
+1. **Race menu: the face lights sit 80 units off in x.** The console-closed D3D diff (a27, real game against p206; private `build43-scratch/measure/rec/rm-closed-2/diff-vs-p206.txt`) finds:
+   - the head and body get the same 6 passes with the same shaders and states in the 1280x720 MSAA target;
+   - the light radius matches (210.32 real, 210.45 port);
+   - the light colours match;
+   - **the three point-light positions (vs c25..c27 of the point-light pass) are exactly -80 off in x** (real (-19.41, 62.89, 64.31), port (-99.41, ...)); y and z are equal. Next: dump the three lights' local and world translates at `RaceSexMenu::Create` and in the first frames on both sides, to find the node that gains the offset.
+
+   Also differing:
+   - the port draws every head mesh once more into a 1024x1024 target first (vs 2f07 / ps 2754, maybe a shadow pass);
+   - the interface plate's 4 quads miss three passes each (vs 2387/ps e52f, vs 3514/ps c331, vs 5558/ps 65ad);
+   - SetIndices and SetStreamSource still get the device pushed twice once per frame in p206 (after the 00876924/0086b3a6 fix): another call site.
+
+   With the full d3d trace list (texture-from-file lines included) p206 stops at about frame 4000 in 00af1cc0 < 00addc00 < 00ada1d0: the same place as the intermittent post-load sound stop (item 2), so the trace's slowdown is a way to reproduce it.
+
+   Earlier notes, from before the console finding: In p205 (an `NV_SHOT` frame of the game's own back buffer, console closed) the face is drawn and lit in the Reflectron. The earlier black face came from the test route leaving the console open: `IsCurrentRenderedMenuTopmost` (00717990) answers false while the console is open (007179be..007179d6), so `Main::UpdateOffscreenInterface` (00871a50) never calls the menu's Draw (007fe1f0) and the 1280x720 multisampled target (kind 0x30, 00b6cebb) is never made; the real game does the same. Earlier D3D diff (private `agents/wt-a27/rec/d3d-racemenu-1/diff-vs-p204e.txt`, made with the console open, so recheck): the port's three menu lights had radius 40.99 against the real 81.99 and a light vector twice as long (the menu model's world scale looked halved). Record the real game's race menu again with the console closed (or through Doc's dialogue) and diff it against a new port recording. The maintainer's earlier reports (too dark, see-through skin, shininess) were all made with the console route; check them on the new frames.
+2. Post-load sound stop (intermittent; 00af1cc0/00aee580): run with `NV_AUDIO_CHECK=1` until it happens.
+3. The `SStartingCell` INI route stops at frame 0 (00a0cb90).
+4. 004b0680 writes past a 0xc block (`NV_BLOCK_CHECK`; probably harmless, unconfirmed).
+
+**Machinery (private):** `build43-scratch/brf2.sh TAG` builds the play viewer (`VB_LLD=1` links with rust-lld), `RM_SHIFT=1800 rm.sh TAG [secs]` runs the save-138 route into the race menu (scratch Documents in `docs-save138`; since p205 the main menu's items appear about 45 s in, so the keys need the shift; without it CONTINUE is pressed too early and `showracemenu` runs at the main menu with no player, which faults in 00559450; the route closes the console after `showracemenu`, since the menu draws its face only with the console closed), `ngdbg2.sh` runs under cdb without the debug heap. `crates/play-patch` is the fast loop for a single fix (host + link only). Every compile goes through `phase0/bin/heavy2.sh`.
+
+### Claude lead, 2026-10-26/27 (read this after 2026-10-28/29, then 2026-10-23/24 below)
 
 **Update, 2026-10-27 afternoon (read first):** this PR collects the fixes found by running the game's own code through the new game into Doc Mitchell's house: words pushed for the wrong call (SetCurrentWeapon in 0094e1d0, the obstacle walks, MoveTo, NavMesh::GetCenter's argument order, a vcall sweep), 65 Havok functions that return the out pointer or `this` their callers read through EAX (hkpEntity::isActive crashed the cell load), stack locals moved from heap blocks into exe-shaped frames (about 400 functions, with `_alloca16` tables), dropped return values, and clippy cleanups. On the play branch (not in this PR yet): the game's own renderer draws through the real Direct3D 9 in its own window (ADR-0008, `NV_D3D9=real`; loading screen, intro, main menu, new-game loading screen), sound to the real device (`NV_SOUND=out`), the thread host's time slice and real-time sleeps, input from the game window, D3DX maths bit-exact and the shader compiler through the player's DLL, and the functions Ghidra never created that the render path reaches. The next play-to-main merge brings those.
 
