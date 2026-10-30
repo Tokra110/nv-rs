@@ -581,25 +581,38 @@ pub fn fn_005f4c00(e: &mut Engine, this: Ptr, index: u32) -> u8 {
 }
 
 // Translated from 005f3780 (decompiled, FalloutNV.exe 1.4.0.525)
-/// Returns a finite time for `index`, or zero after logging a negative or
-/// out-of-range index and a NaN entry.
+/// Returns the time stored at `index` (anything but NaN), zero when the time
+/// array is null, and zero after logging a negative or out-of-range index or a
+/// NaN time. The type name is looked up only for the two index logs.
 pub fn fn_005f3780(e: &mut Engine, this: Ptr, index: u32) -> f64 {
     let signed_index = index as i32;
     let group = e.mem.u16(this.addr().wrapping_add(0x10));
-    let ty = u32::from(fn_005f2440(e, group));
-    let type_name = e
-        .mem
-        .u32(TYPE_NAME_TABLE.wrapping_add(ty.wrapping_mul(0x24)));
     if signed_index < 0 {
+        // 005f3790-005f37bd: four words (ADD ESP,0x10); the group id pushed
+        // first at 005f3794 is the trailing %04X argument.
+        let ty = u32::from(fn_005f2440(e, group));
+        let type_name = e
+            .mem
+            .u32(TYPE_NAME_TABLE.wrapping_add(ty.wrapping_mul(0x24)));
         e.call(
             INVALID_ACTION_LOG,
-            &args![LOG_ANIM_GROUP_ACTION_LOW, index, type_name],
+            &args![
+                LOG_ANIM_GROUP_ACTION_LOW,
+                index,
+                type_name,
+                u32::from(group)
+            ],
         );
         return 0.0;
     }
 
     let count = e.mem.u32(this.addr().wrapping_add(0x14));
     if index >= count {
+        // 005f37d5-005f37ed: the type name is looked up here, not on entry.
+        let ty = u32::from(fn_005f2440(e, group));
+        let type_name = e
+            .mem
+            .u32(TYPE_NAME_TABLE.wrapping_add(ty.wrapping_mul(0x24)));
         e.call(
             INVALID_ACTION_LOG,
             &args![
@@ -1116,7 +1129,12 @@ pub fn fn_005f3a20(e: &mut Engine, sequence: Ptr, filename: Ptr) -> Ptr {
                     bad = true;
                 } else {
                     let compare_source = e.call(0x0043_b1b0, &args![note_string]).u32();
-                    if anim_prefix(e, compare_source, 0x0104_87bc) {
+                    // 005f3c8c-005f3c9f: the parent prefix (010487bc) is compared with the
+                    // constant length 4 (PUSH 0x4); no strlen call is made for it.
+                    if e.call(STRNICMP, &args![compare_source, 0x0104_87bcu32, 4u32])
+                        .i32()
+                        == 0
+                    {
                         anim_parent_note(e, group, note_string);
                     } else {
                         let source = e.call(0x0043_b1b0, &args![note_string]).u32();
@@ -1124,11 +1142,15 @@ pub fn fn_005f3a20(e: &mut Engine, sequence: Ptr, filename: Ptr) -> Ptr {
                         e.call(0x0040_6d30, &args![copied, 0x104u32, source]);
                         let mut note = copied;
                         while note != 0 && e.call(STRLEN, &args![note]).u32() != 0 {
+                            // 005f3d59-005f3d6d: a leading CR skips to the next
+                            // line, and the result reaches the _strnicmp at
+                            // 005f3d90 unchecked, a null pointer included. A null
+                            // there (a CR with no line feed after it) ends the
+                            // process: 00ec7ec0 reports it through 00ec7c30, and
+                            // with no handler installed that goes to
+                            // __invoke_watson (00ec7b08).
                             if e.mem.u8(note) == 13 {
                                 note = fn_005f3870(e, Ptr::new(note)).addr();
-                                if note == 0 {
-                                    break;
-                                }
                             }
                             let special = e.global::<u32>(NOTE_SPECIAL_PREFIX);
                             if anim_prefix(e, note, special) {
@@ -1171,7 +1193,11 @@ pub fn fn_005f3a20(e: &mut Engine, sequence: Ptr, filename: Ptr) -> Ptr {
                                     }
                                 }
                             }
-                            note = fn_005f3870(e, Ptr::new(note)).addr();
+                            // 005f4881 CMP [EBP-0x3b8],0 / JZ 005f489f: only a
+                            // non-null note advances to the next line.
+                            if note != 0 {
+                                note = fn_005f3870(e, Ptr::new(note)).addr();
+                            }
                         }
                     }
                 }
@@ -1401,7 +1427,6 @@ mod tests {
         });
         e.register_double(STRLEN, |e, arguments| {
             let length = match arguments[0] {
-                0x0104_87bc => 4,
                 0x9000 => 3,
                 0x0104_878c => 6,
                 0x0104_8784 => 5,
@@ -1459,6 +1484,199 @@ mod tests {
             2
         );
         assert_eq!(e.mem.u8(0x6100), b'S');
+    }
+
+    #[test]
+    fn lone_cr_note_passes_null_to_the_special_compare_which_ends_the_process() {
+        let mut e = Engine::new();
+        e.map(0x2000, 0x100);
+        e.map(0x3000, 0x20);
+        e.map(0x3100, 0x20);
+        e.map(0x5000, 8);
+        e.map(0x6100, 16);
+        e.map(0x6200, 4);
+        e.map(NOTE_SPECIAL_PREFIX, 4);
+        e.mem.set_u32(0x5004, 0x6100);
+        e.mem.set_u32(NOTE_SPECIAL_PREFIX, 0x9000);
+        // A lone CR: 005f3870 finds no line feed and returns null.
+        e.mem.set_u8(0x6100, b'\r');
+        e.mem.set_u8(0x6101, 0);
+        e.register_double(STRRCHR, |_, arguments| {
+            assert_eq!(arguments, [0x3000, 0x5c]);
+            Ret::default()
+        });
+        e.register_double(0x0043_b2b0, |_, arguments| {
+            assert_eq!(arguments.len(), 1);
+            Ret::default()
+        });
+        e.register_double(0x006c_9900, |_, arguments| {
+            assert_eq!(arguments, [0x2000]);
+            Ret {
+                eax: 0x2100,
+                ..Ret::default()
+            }
+        });
+        let mut note_getter_calls = 0;
+        e.register_double(0x0043_b1b0, move |_, arguments| {
+            let pointer = if arguments[0] == 0x2100 {
+                0x3100
+            } else {
+                note_getter_calls += 1;
+                if note_getter_calls == 1 {
+                    0x6200
+                } else {
+                    0x6100
+                }
+            };
+            Ret {
+                eax: pointer,
+                ..Ret::default()
+            }
+        });
+        e.register_double(0x0040_6d00, |e, arguments| {
+            assert_eq!(arguments.len(), 4);
+            e.mem.set_u8(arguments[0], 0);
+            Ret::default()
+        });
+        e.register_double(0x0084_e3a0, |_, arguments| {
+            assert_eq!(arguments, [0x2000]);
+            Ret::default()
+        });
+        e.register_double(0x0070_0300, |_, arguments| {
+            assert_eq!(arguments, [0x2000]);
+            Ret {
+                eax: 0x4000,
+                ..Ret::default()
+            }
+        });
+        e.register_double(0x0049_5f30, |e, arguments| {
+            assert_eq!(arguments.len(), 2);
+            assert_eq!(arguments[0], 0x4000);
+            e.mem.set_u32(arguments[1], 1);
+            Ret {
+                eax: 0x5000,
+                ..Ret::default()
+            }
+        });
+        e.register_double(0x0071_7e50, |_, arguments| {
+            assert_eq!(arguments, [0x5000]);
+            Ret {
+                eax: 0x5004,
+                ..Ret::default()
+            }
+        });
+        e.register_double(0x0048_af40, |e, arguments| {
+            assert_eq!(arguments.len(), 2);
+            assert_eq!(arguments[1], 0x5004);
+            e.mem.set_u32(arguments[0], e.mem.u32(arguments[1]));
+            Ret::default()
+        });
+        e.register_double(0x006a_7f50, |_, arguments| {
+            assert_eq!(arguments, [0x5000]);
+            Ret {
+                st0: 1.25,
+                ..Ret::default()
+            }
+        });
+        e.register_double(0x0048_af70, |e, arguments| {
+            assert_eq!(arguments.len(), 1);
+            Ret {
+                eax: u32::from(e.mem.u32(arguments[0]) != 0),
+                ..Ret::default()
+            }
+        });
+        e.register_double(0x0040_6d30, |e, arguments| {
+            assert_eq!(arguments.len(), 3);
+            assert_eq!(arguments[2], 0x6100);
+            let mut index = 0;
+            loop {
+                let byte = e.mem.u8(arguments[2] + index);
+                e.mem.set_u8(arguments[0] + index, byte);
+                if byte == 0 {
+                    break;
+                }
+                index += 1;
+            }
+            Ret::default()
+        });
+        e.register_double(STRLEN, |e, arguments| {
+            let length = match arguments[0] {
+                0x9000 => 3,
+                address => {
+                    let mut size = 0;
+                    while e.mem.u8(address + size) != 0 {
+                        size += 1;
+                    }
+                    size
+                }
+            };
+            Ret {
+                eax: length,
+                ..Ret::default()
+            }
+        });
+        e.register_double(STRNICMP, |_, arguments| {
+            assert_eq!(arguments.len(), 3);
+            // 00ec7ed0: a null string sets errno to EINVAL (00ec7edf) and calls
+            // 00ec7c30. No handler is ever installed (the only store to 0126fd9c,
+            // 00ec7b01, is the encoded null __init_pointers passes at 00eccf26), so
+            // 00ec7c30 goes on to __invoke_watson (00ec7b08), which ends the process;
+            // 00ec7eed (0x7fffffff) is not reached.
+            if arguments[0] == 0 {
+                panic!("_strnicmp(NULL): __invoke_watson ends the process");
+            }
+            // 005f3c8c-005f3c9f: the empty line at 0x6200 against the parent prefix
+            // (010487bc) with length 4; __ascii_strnicmp (00ed5bc0) stops at the
+            // terminator and answers -1 (00ed5c11).
+            assert_eq!(arguments, [0x6200, 0x0104_87bc, 4]);
+            Ret {
+                eax: u32::MAX,
+                ..Ret::default()
+            }
+        });
+        e.register_double(STRCHR, |_, arguments| {
+            assert_eq!(arguments.len(), 2);
+            assert_eq!(arguments[1], 10);
+            Ret::default()
+        });
+        e.call_log = Some(vec![]);
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            e.call(0x005f_3a20, &[0x2000, 0x3000])
+        }));
+        assert!(ended.is_err());
+        let calls = e.call_log.take().unwrap();
+        let note_string = calls
+            .iter()
+            .find(|(address, _)| *address == 0x0048_af40)
+            .unwrap()
+            .1[0];
+        let copied = calls
+            .iter()
+            .find(|(address, _)| *address == 0x0040_6d30)
+            .unwrap()
+            .1[0];
+        let start = calls
+            .iter()
+            .position(|(address, _)| *address == 0x0048_af70)
+            .unwrap();
+        let expected: [(u32, Vec<u32>); 9] = [
+            (0x0048_af70, vec![note_string]),
+            // 005f3c8c-005f3c9f: the parent prefix compare, no strlen before it.
+            (0x0043_b1b0, vec![note_string]),
+            (STRNICMP, vec![0x6200, 0x0104_87bc, 4]),
+            (0x0043_b1b0, vec![note_string]),
+            (0x0040_6d30, vec![copied, 0x104, 0x6100]),
+            // 005f3d40: the copied line is not empty.
+            (STRLEN, vec![copied]),
+            // 005f3d65: 005f3870 finds no line feed after the CR and returns null.
+            (STRCHR, vec![copied, 10]),
+            // 005f3d7a-005f3d90: the null note goes to _strnicmp unchecked, and the
+            // process ends there: the blend branch (005f3d9c), the number-tag
+            // compares (005f3dc3) and the string's destructor (004381b0) never run.
+            (STRLEN, vec![0x9000]),
+            (STRNICMP, vec![0, 0x9000, 3]),
+        ];
+        assert_eq!(calls[start..], expected);
     }
 
     #[test]
@@ -2499,6 +2717,45 @@ mod tests {
             ..Ret::default()
         });
         assert_eq!(e.call(0x005f_3870, &[0x2000]).u32(), 0x2003);
+    }
+
+    #[test]
+    fn time_lookup_index_logs_end_with_the_group_id() {
+        let mut e = Engine::new();
+        let animation = 0x1000;
+        e.map(animation, 0x20);
+        e.map(TYPE_NAME_TABLE, 0x24 * 4);
+        // Type byte 3 under weapon bits, so the group word differs from the type.
+        e.mem.set_u16(animation + 0x10, 0x0203);
+        e.mem.set_u32(TYPE_NAME_TABLE + 3 * 0x24, 0x3000);
+        e.mem.set_u32(animation + 0x14, 2);
+        e.register_double(INVALID_ACTION_LOG, |_, arguments| {
+            if arguments[0] == LOG_ANIM_GROUP_ACTION_LOW {
+                // 005f37bd ADD ESP,0x10: format, index, type name, group id.
+                assert_eq!(
+                    arguments,
+                    [LOG_ANIM_GROUP_ACTION_LOW, 0xffff_fffe, 0x3000, 0x0203]
+                );
+            } else {
+                // 005f3809 ADD ESP,0x14: format, index, count, type name, group id.
+                assert_eq!(
+                    arguments,
+                    [LOG_ANIM_GROUP_ACTION_HIGH, 2, 2, 0x3000, 0x0203]
+                );
+            }
+            Ret::default()
+        });
+        e.call_log = Some(vec![]);
+        assert_eq!(e.call(0x005f_3780, &[animation, 0xffff_fffe]).f64(), 0.0);
+        assert_eq!(e.call(0x005f_3780, &[animation, 2]).f64(), 0.0);
+        let calls = e.call_log.take().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(address, _)| *address == INVALID_ACTION_LOG)
+                .count(),
+            2
+        );
     }
 
     #[test]
